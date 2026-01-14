@@ -21,7 +21,7 @@ PROGRESS_FILE="progress.json"
 CLAUDE_CODE_CMD="claude"
 MAX_CALLS_PER_HOUR=100  # Adjust based on your plan
 VERBOSE_PROGRESS=false  # Default: no verbose progress updates
-CLAUDE_TIMEOUT_MINUTES=15  # Default: 15 minutes timeout for Claude Code execution
+CLAUDE_TIMEOUT_MINUTES=30  # Default: 30 minutes timeout for Claude Code execution
 SLEEP_DURATION=3600     # 1 hour in seconds
 CALL_COUNT_FILE=".call_count"
 TIMESTAMP_FILE=".last_reset"
@@ -33,7 +33,7 @@ STREAM_LIVE_LOG=".ralph_stream_live.log"  # File for live stream events
 CLAUDE_OUTPUT_FORMAT="json"              # Options: json, text
 CLAUDE_ALLOWED_TOOLS="Write,Bash(git *),Read"  # Comma-separated list of allowed tools
 CLAUDE_USE_CONTINUE=true                 # Enable session continuity
-CLAUDE_SESSION_FILE=".claude_session_id" # Session ID persistence file
+CLAUDE_SESSION_FILE=".ralph_claude_session_id" # Ralph-specific Claude session ID (isolated from other Claude instances)
 CLAUDE_MIN_VERSION="2.0.76"              # Minimum required Claude CLI version
 
 # Session management configuration (Phase 1.2)
@@ -122,14 +122,27 @@ setup_tmux_session() {
     else
         ralph_cmd="'$ralph_home/ralph_loop.sh'"
     fi
-    
+
+    # Pass through all relevant flags
     if [[ "$MAX_CALLS_PER_HOUR" != "100" ]]; then
         ralph_cmd="$ralph_cmd --calls $MAX_CALLS_PER_HOUR"
     fi
     if [[ "$PROMPT_FILE" != "PROMPT.md" ]]; then
         ralph_cmd="$ralph_cmd --prompt '$PROMPT_FILE'"
     fi
-    
+    if [[ "$CLAUDE_TIMEOUT_MINUTES" != "30" ]]; then
+        ralph_cmd="$ralph_cmd --timeout $CLAUDE_TIMEOUT_MINUTES"
+    fi
+    if [[ "$STREAM_MODE" == "true" ]]; then
+        ralph_cmd="$ralph_cmd --stream"
+    fi
+    if [[ "$VERBOSE_PROGRESS" == "true" ]]; then
+        ralph_cmd="$ralph_cmd --verbose"
+    fi
+    if [[ -n "$CLAUDE_ALLOWED_TOOLS" && "$CLAUDE_ALLOWED_TOOLS" != "Write,Bash(git *),Read" ]]; then
+        ralph_cmd="$ralph_cmd --allowed-tools '$CLAUDE_ALLOWED_TOOLS'"
+    fi
+
     tmux send-keys -t "$session_name:0.0" "$ralph_cmd" Enter
     
     # Focus on left pane (main ralph loop)
@@ -550,16 +563,39 @@ init_claude_session() {
 }
 
 # Save session ID after successful execution
+# Extracts session_id from Claude's JSON output (various formats)
 save_claude_session() {
     local output_file=$1
 
-    # Try to extract session ID from JSON output
-    if [[ -f "$output_file" ]]; then
-        local session_id=$(jq -r '.metadata.session_id // .session_id // empty' "$output_file" 2>/dev/null)
-        if [[ -n "$session_id" && "$session_id" != "null" ]]; then
-            echo "$session_id" > "$CLAUDE_SESSION_FILE"
-            log_status "INFO" "Saved Claude session: ${session_id:0:20}..."
-        fi
+    if [[ ! -f "$output_file" ]]; then
+        return 0
+    fi
+
+    local session_id=""
+
+    # Try multiple extraction patterns for session_id
+    # Pattern 1: Standard JSON output structure
+    session_id=$(jq -r '.session_id // empty' "$output_file" 2>/dev/null)
+
+    # Pattern 2: Nested in metadata
+    if [[ -z "$session_id" || "$session_id" == "null" ]]; then
+        session_id=$(jq -r '.metadata.session_id // empty' "$output_file" 2>/dev/null)
+    fi
+
+    # Pattern 3: Stream-json format - look for session in result object
+    if [[ -z "$session_id" || "$session_id" == "null" ]]; then
+        session_id=$(jq -r '.result.session_id // empty' "$output_file" 2>/dev/null)
+    fi
+
+    # Pattern 4: Search through file for session_id field (stream-json has multiple lines)
+    if [[ -z "$session_id" || "$session_id" == "null" ]]; then
+        session_id=$(grep -oP '"session_id"\s*:\s*"\K[^"]+' "$output_file" 2>/dev/null | head -1)
+    fi
+
+    # Save if we found a valid session ID
+    if [[ -n "$session_id" && "$session_id" != "null" && ${#session_id} -gt 10 ]]; then
+        echo "$session_id" > "$CLAUDE_SESSION_FILE"
+        log_status "INFO" "Saved Ralph-specific session: ${session_id:0:20}..."
     fi
 }
 
@@ -796,9 +832,21 @@ build_claude_command() {
         done
     fi
 
-    # Add session continuity flag
+    # Add session continuity flag - use --resume with Ralph's own session ID
+    # This ensures Ralph never hijacks other Claude sessions (like Cursor)
     if [[ "$CLAUDE_USE_CONTINUE" == "true" ]]; then
-        CLAUDE_CMD_ARGS+=("--continue")
+        # Read Ralph's own session ID (isolated from global Claude sessions)
+        local ralph_session_id=""
+        if [[ -f "$CLAUDE_SESSION_FILE" ]]; then
+            ralph_session_id=$(cat "$CLAUDE_SESSION_FILE" 2>/dev/null)
+        fi
+
+        if [[ -n "$ralph_session_id" && "$ralph_session_id" != "null" ]]; then
+            # Resume Ralph's specific session
+            CLAUDE_CMD_ARGS+=("--resume" "$ralph_session_id")
+            log_status "INFO" "Resuming Ralph session: ${ralph_session_id:0:20}..."
+        fi
+        # If no session ID yet, Claude will create a new one (captured in save_claude_session)
     fi
 
     # Add loop context as system prompt (no escaping needed - array handles it)
