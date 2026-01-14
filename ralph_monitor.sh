@@ -5,6 +5,7 @@ set -e
 
 STATUS_FILE="status.json"
 LOG_FILE="logs/ralph.log"
+STREAM_LIVE_LOG=".ralph_stream_live.log"
 REFRESH_INTERVAL=2
 
 # Colors
@@ -77,14 +78,18 @@ display_status() {
     if [[ -f "progress.json" ]]; then
         local progress_data=$(cat "progress.json" 2>/dev/null)
         local progress_status=$(echo "$progress_data" | jq -r '.status // "idle"' 2>/dev/null || echo "idle")
-        
-        if [[ "$progress_status" == "executing" ]]; then
+
+        if [[ "$progress_status" == "executing" || "$progress_status" == "streaming" ]]; then
             local indicator=$(echo "$progress_data" | jq -r '.indicator // "⠋"' 2>/dev/null || echo "⠋")
             local elapsed=$(echo "$progress_data" | jq -r '.elapsed_seconds // "0"' 2>/dev/null || echo "0")
             local last_output=$(echo "$progress_data" | jq -r '.last_output // ""' 2>/dev/null || echo "")
-            
+
             echo -e "${YELLOW}┌─ Claude Code Progress ──────────────────────────────────────────────────┐${NC}"
-            echo -e "${YELLOW}│${NC} Status:         ${indicator} Working (${elapsed}s elapsed)"
+            if [[ "$progress_status" == "streaming" ]]; then
+                echo -e "${YELLOW}│${NC} Status:         ${RED}🔴${NC} LIVE Streaming"
+            else
+                echo -e "${YELLOW}│${NC} Status:         ${indicator} Working (${elapsed}s elapsed)"
+            fi
             if [[ -n "$last_output" && "$last_output" != "" ]]; then
                 # Truncate long output for display
                 local display_output=$(echo "$last_output" | head -c 60)
@@ -93,6 +98,18 @@ display_status() {
             echo -e "${YELLOW}└─────────────────────────────────────────────────────────────────────────┘${NC}"
             echo
         fi
+    fi
+
+    # Stream Events section (if stream mode is active)
+    if [[ -f "$STREAM_LIVE_LOG" && -s "$STREAM_LIVE_LOG" ]]; then
+        echo -e "${PURPLE}┌─ 🔴 Live Stream Events ─────────────────────────────────────────────────┐${NC}"
+        tail -n 10 "$STREAM_LIVE_LOG" | while IFS= read -r line; do
+            # Truncate long lines for display
+            local display_line="${line:0:70}"
+            echo -e "${PURPLE}│${NC} $display_line"
+        done
+        echo -e "${PURPLE}└─────────────────────────────────────────────────────────────────────────┘${NC}"
+        echo
     fi
     
     # Recent logs
