@@ -10,6 +10,7 @@ SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
 source "$SCRIPT_DIR/lib/date_utils.sh"
 source "$SCRIPT_DIR/lib/response_analyzer.sh"
 source "$SCRIPT_DIR/lib/circuit_breaker.sh"
+source "$SCRIPT_DIR/lib/stream_parser.sh"
 
 # Configuration
 PROMPT_FILE="PROMPT.md"
@@ -20,17 +21,19 @@ PROGRESS_FILE="progress.json"
 CLAUDE_CODE_CMD="claude"
 MAX_CALLS_PER_HOUR=100  # Adjust based on your plan
 VERBOSE_PROGRESS=false  # Default: no verbose progress updates
-CLAUDE_TIMEOUT_MINUTES=15  # Default: 15 minutes timeout for Claude Code execution
+CLAUDE_TIMEOUT_MINUTES=30  # Default: 30 minutes timeout for Claude Code execution
 SLEEP_DURATION=3600     # 1 hour in seconds
 CALL_COUNT_FILE=".call_count"
 TIMESTAMP_FILE=".last_reset"
 USE_TMUX=false
+STREAM_MODE=false               # Default: no real-time streaming (use --stream to enable)
+STREAM_LIVE_LOG=".ralph_stream_live.log"  # File for live stream events
 
 # Modern Claude CLI configuration (Phase 1.1)
 CLAUDE_OUTPUT_FORMAT="json"              # Options: json, text
 CLAUDE_ALLOWED_TOOLS="Write,Bash(git *),Read"  # Comma-separated list of allowed tools
 CLAUDE_USE_CONTINUE=true                 # Enable session continuity
-CLAUDE_SESSION_FILE=".claude_session_id" # Session ID persistence file
+CLAUDE_SESSION_FILE=".ralph_claude_session_id" # Ralph-specific Claude session ID (isolated from other Claude instances)
 CLAUDE_MIN_VERSION="2.0.76"              # Minimum required Claude CLI version
 
 # Session management configuration (Phase 1.2)
@@ -119,14 +122,27 @@ setup_tmux_session() {
     else
         ralph_cmd="'$ralph_home/ralph_loop.sh'"
     fi
-    
+
+    # Pass through all relevant flags
     if [[ "$MAX_CALLS_PER_HOUR" != "100" ]]; then
         ralph_cmd="$ralph_cmd --calls $MAX_CALLS_PER_HOUR"
     fi
     if [[ "$PROMPT_FILE" != "PROMPT.md" ]]; then
         ralph_cmd="$ralph_cmd --prompt '$PROMPT_FILE'"
     fi
-    
+    if [[ "$CLAUDE_TIMEOUT_MINUTES" != "30" ]]; then
+        ralph_cmd="$ralph_cmd --timeout $CLAUDE_TIMEOUT_MINUTES"
+    fi
+    if [[ "$STREAM_MODE" == "true" ]]; then
+        ralph_cmd="$ralph_cmd --stream"
+    fi
+    if [[ "$VERBOSE_PROGRESS" == "true" ]]; then
+        ralph_cmd="$ralph_cmd --verbose"
+    fi
+    if [[ -n "$CLAUDE_ALLOWED_TOOLS" && "$CLAUDE_ALLOWED_TOOLS" != "Write,Bash(git *),Read" ]]; then
+        ralph_cmd="$ralph_cmd --allowed-tools '$CLAUDE_ALLOWED_TOOLS'"
+    fi
+
     tmux send-keys -t "$session_name:0.0" "$ralph_cmd" Enter
     
     # Focus on left pane (main ralph loop)
@@ -547,16 +563,39 @@ init_claude_session() {
 }
 
 # Save session ID after successful execution
+# Extracts session_id from Claude's JSON output (various formats)
 save_claude_session() {
     local output_file=$1
 
-    # Try to extract session ID from JSON output
-    if [[ -f "$output_file" ]]; then
-        local session_id=$(jq -r '.metadata.session_id // .session_id // empty' "$output_file" 2>/dev/null)
-        if [[ -n "$session_id" && "$session_id" != "null" ]]; then
-            echo "$session_id" > "$CLAUDE_SESSION_FILE"
-            log_status "INFO" "Saved Claude session: ${session_id:0:20}..."
-        fi
+    if [[ ! -f "$output_file" ]]; then
+        return 0
+    fi
+
+    local session_id=""
+
+    # Try multiple extraction patterns for session_id
+    # Pattern 1: Standard JSON output structure
+    session_id=$(jq -r '.session_id // empty' "$output_file" 2>/dev/null)
+
+    # Pattern 2: Nested in metadata
+    if [[ -z "$session_id" || "$session_id" == "null" ]]; then
+        session_id=$(jq -r '.metadata.session_id // empty' "$output_file" 2>/dev/null)
+    fi
+
+    # Pattern 3: Stream-json format - look for session in result object
+    if [[ -z "$session_id" || "$session_id" == "null" ]]; then
+        session_id=$(jq -r '.result.session_id // empty' "$output_file" 2>/dev/null)
+    fi
+
+    # Pattern 4: Search through file for session_id field (stream-json has multiple lines)
+    if [[ -z "$session_id" || "$session_id" == "null" ]]; then
+        session_id=$(grep -oP '"session_id"\s*:\s*"\K[^"]+' "$output_file" 2>/dev/null | head -1)
+    fi
+
+    # Save if we found a valid session ID
+    if [[ -n "$session_id" && "$session_id" != "null" && ${#session_id} -gt 10 ]]; then
+        echo "$session_id" > "$CLAUDE_SESSION_FILE"
+        log_status "INFO" "Saved Ralph-specific session: ${session_id:0:20}..."
     fi
 }
 
@@ -771,7 +810,10 @@ build_claude_command() {
     fi
 
     # Add output format flag
-    if [[ "$CLAUDE_OUTPUT_FORMAT" == "json" ]]; then
+    # Use stream-json for real-time streaming mode, json otherwise
+    if [[ "$STREAM_MODE" == "true" ]]; then
+        CLAUDE_CMD_ARGS+=("--output-format" "stream-json")
+    elif [[ "$CLAUDE_OUTPUT_FORMAT" == "json" ]]; then
         CLAUDE_CMD_ARGS+=("--output-format" "json")
     fi
 
@@ -790,9 +832,21 @@ build_claude_command() {
         done
     fi
 
-    # Add session continuity flag
+    # Add session continuity flag - use --resume with Ralph's own session ID
+    # This ensures Ralph never hijacks other Claude sessions (like Cursor)
     if [[ "$CLAUDE_USE_CONTINUE" == "true" ]]; then
-        CLAUDE_CMD_ARGS+=("--continue")
+        # Read Ralph's own session ID (isolated from global Claude sessions)
+        local ralph_session_id=""
+        if [[ -f "$CLAUDE_SESSION_FILE" ]]; then
+            ralph_session_id=$(cat "$CLAUDE_SESSION_FILE" 2>/dev/null)
+        fi
+
+        if [[ -n "$ralph_session_id" && "$ralph_session_id" != "null" ]]; then
+            # Resume Ralph's specific session
+            CLAUDE_CMD_ARGS+=("--resume" "$ralph_session_id")
+            log_status "INFO" "Resuming Ralph session: ${ralph_session_id:0:20}..."
+        fi
+        # If no session ID yet, Claude will create a new one (captured in save_claude_session)
     fi
 
     # Add loop context as system prompt (no escaping needed - array handles it)
@@ -853,53 +907,90 @@ execute_claude_code() {
     fi
 
     # Execute Claude Code
-    if [[ "$use_modern_cli" == "true" ]]; then
-        # Modern execution with command array (shell-injection safe)
-        # Execute array directly without bash -c to prevent shell metacharacter interpretation
-        if timeout ${timeout_seconds}s "${CLAUDE_CMD_ARGS[@]}" > "$output_file" 2>&1 &
-        then
-            :  # Continue to wait loop
-        else
-            log_status "ERROR" "❌ Failed to start Claude Code process (modern mode)"
-            # Fall back to legacy mode
-            log_status "INFO" "Falling back to legacy mode..."
-            use_modern_cli=false
+    # Stream mode: parse and display events in real-time
+    # Normal mode: capture output to file silently
+
+    if [[ "$STREAM_MODE" == "true" && "$use_modern_cli" == "true" ]]; then
+        # STREAM MODE: Real-time event display
+        log_status "INFO" "🔴 LIVE: Streaming Claude events in real-time"
+
+        # Clear previous stream log
+        : > "$STREAM_LIVE_LOG"
+
+        # Execute with tee to capture AND stream parse simultaneously
+        # We use a subshell to handle the piping properly
+        (
+            timeout ${timeout_seconds}s "${CLAUDE_CMD_ARGS[@]}" 2>&1 | while IFS= read -r line; do
+                # Save raw output to log file
+                echo "$line" >> "$output_file"
+
+                # Parse and display formatted event (if valid)
+                local formatted
+                formatted=$(parse_stream_line "$line" 2>/dev/null)
+                if [[ -n "$formatted" ]]; then
+                    echo "$formatted"
+                    echo "$formatted" >> "$STREAM_LIVE_LOG"
+                fi
+
+                # Update progress file for monitor
+                echo "{\"status\": \"streaming\", \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\"}" > "$PROGRESS_FILE"
+            done
+        ) &
+        local claude_pid=$!
+
+        # Wait for streaming to complete
+        wait $claude_pid
+        local exit_code=$?
+
+    else
+        # NORMAL MODE: Silent execution with progress spinner
+        if [[ "$use_modern_cli" == "true" ]]; then
+            # Modern execution with command array (shell-injection safe)
+            # Execute array directly without bash -c to prevent shell metacharacter interpretation
+            if timeout ${timeout_seconds}s "${CLAUDE_CMD_ARGS[@]}" > "$output_file" 2>&1 &
+            then
+                :  # Continue to wait loop
+            else
+                log_status "ERROR" "❌ Failed to start Claude Code process (modern mode)"
+                # Fall back to legacy mode
+                log_status "INFO" "Falling back to legacy mode..."
+                use_modern_cli=false
+            fi
         fi
-    fi
 
-    # Fall back to legacy stdin piping if modern mode failed or not enabled
-    if [[ "$use_modern_cli" == "false" ]]; then
-        if timeout ${timeout_seconds}s $CLAUDE_CODE_CMD < "$PROMPT_FILE" > "$output_file" 2>&1 &
-        then
-            :  # Continue to wait loop
-        else
-            log_status "ERROR" "❌ Failed to start Claude Code process"
-            return 1
-        fi
-    fi
-
-    # Get PID and monitor progress
-    local claude_pid=$!
-    local progress_counter=0
-
-    # Show progress while Claude Code is running
-    while kill -0 $claude_pid 2>/dev/null; do
-        progress_counter=$((progress_counter + 1))
-        case $((progress_counter % 4)) in
-            1) progress_indicator="⠋" ;;
-            2) progress_indicator="⠙" ;;
-            3) progress_indicator="⠹" ;;
-            0) progress_indicator="⠸" ;;
-        esac
-
-        # Get last line from output if available
-        local last_line=""
-        if [[ -f "$output_file" && -s "$output_file" ]]; then
-            last_line=$(tail -1 "$output_file" 2>/dev/null | head -c 80)
+        # Fall back to legacy stdin piping if modern mode failed or not enabled
+        if [[ "$use_modern_cli" == "false" ]]; then
+            if timeout ${timeout_seconds}s $CLAUDE_CODE_CMD < "$PROMPT_FILE" > "$output_file" 2>&1 &
+            then
+                :  # Continue to wait loop
+            else
+                log_status "ERROR" "❌ Failed to start Claude Code process"
+                return 1
+            fi
         fi
 
-        # Update progress file for monitor
-        cat > "$PROGRESS_FILE" << EOF
+        # Get PID and monitor progress
+        local claude_pid=$!
+        local progress_counter=0
+
+        # Show progress while Claude Code is running
+        while kill -0 $claude_pid 2>/dev/null; do
+            progress_counter=$((progress_counter + 1))
+            case $((progress_counter % 4)) in
+                1) progress_indicator="⠋" ;;
+                2) progress_indicator="⠙" ;;
+                3) progress_indicator="⠹" ;;
+                0) progress_indicator="⠸" ;;
+            esac
+
+            # Get last line from output if available
+            local last_line=""
+            if [[ -f "$output_file" && -s "$output_file" ]]; then
+                last_line=$(tail -1 "$output_file" 2>/dev/null | head -c 80)
+            fi
+
+            # Update progress file for monitor
+            cat > "$PROGRESS_FILE" << EOF
 {
     "status": "executing",
     "indicator": "$progress_indicator",
@@ -909,21 +1000,22 @@ execute_claude_code() {
 }
 EOF
 
-        # Only log if verbose mode is enabled
-        if [[ "$VERBOSE_PROGRESS" == "true" ]]; then
-            if [[ -n "$last_line" ]]; then
-                log_status "INFO" "$progress_indicator Claude Code: $last_line... (${progress_counter}0s)"
-            else
-                log_status "INFO" "$progress_indicator Claude Code working... (${progress_counter}0s elapsed)"
+            # Only log if verbose mode is enabled
+            if [[ "$VERBOSE_PROGRESS" == "true" ]]; then
+                if [[ -n "$last_line" ]]; then
+                    log_status "INFO" "$progress_indicator Claude Code: $last_line... (${progress_counter}0s)"
+                else
+                    log_status "INFO" "$progress_indicator Claude Code working... (${progress_counter}0s elapsed)"
+                fi
             fi
-        fi
 
-        sleep 10
-    done
+            sleep 10
+        done
 
-    # Wait for the process to finish and get exit code
-    wait $claude_pid
-    local exit_code=$?
+        # Wait for the process to finish and get exit code
+        wait $claude_pid
+        local exit_code=$?
+    fi
 
     if [ $exit_code -eq 0 ]; then
         # Only increment counter on successful execution
@@ -1178,6 +1270,7 @@ Options:
     -m, --monitor           Start with tmux session and live monitor (requires tmux)
     -v, --verbose           Show detailed progress updates during execution
     -t, --timeout MIN       Set Claude Code execution timeout in minutes (default: $CLAUDE_TIMEOUT_MINUTES)
+    --stream, --live        Enable real-time streaming of Claude events (reads, writes, thinking)
     --reset-circuit         Reset circuit breaker to CLOSED state
     --circuit-status        Show circuit breaker status and exit
     --reset-session         Reset session state and exit (clears session continuity)
@@ -1207,9 +1300,19 @@ Examples:
     $0 --monitor             # Start with integrated tmux monitoring
     $0 --monitor --timeout 30   # 30-minute timeout for complex tasks
     $0 --verbose --timeout 5    # 5-minute timeout with detailed progress
+    $0 --stream              # Real-time streaming of Claude events
+    $0 --stream --monitor    # Streaming with tmux monitoring (best experience)
     $0 --output-format text     # Use legacy text output format
     $0 --no-continue            # Disable session continuity
     $0 --session-expiry 48      # 48-hour session expiration
+
+Stream Mode Output (--stream):
+    [11:15:32] 📖 Read: GameScene.ts
+    [11:15:33] 🔍 Grep: "isometric" in src/
+    [11:15:35] ✏️  Edit: grid.ts
+    [11:15:36] 💭 "Adding pathfinding system..."
+    [11:15:40] 📝 Write: Pathfinding.ts
+    [11:15:42] 💻 Bash: npm test
 
 HELPEOF
 }
@@ -1244,6 +1347,11 @@ while [[ $# -gt 0 ]]; do
             ;;
         -v|--verbose)
             VERBOSE_PROGRESS=true
+            shift
+            ;;
+        --stream|--live)
+            STREAM_MODE=true
+            log_status "INFO" "🔴 Stream mode enabled - real-time event display"
             shift
             ;;
         -t|--timeout)
